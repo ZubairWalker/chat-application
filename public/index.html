@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chat Application - Real-Time Tester</title>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #0f172a; color: #f8fafc; display: flex; height: 100vh; }
+    .sidebar { width: 320px; background: #1e293b; border-right: 1px solid #334155; display: flex; flex-direction: column; padding: 1rem; gap: 1rem; }
+    .main { flex: 1; display: flex; flex-direction: column; }
+    .card { background: #334155; padding: 0.75rem; border-radius: 8px; }
+    input, button, select { width: 100%; padding: 0.5rem; margin-top: 0.4rem; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: white; }
+    button { background: #3b82f6; border: none; cursor: pointer; font-weight: 600; }
+    button:hover { background: #2563eb; }
+    .header { padding: 1rem; background: #1e293b; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; }
+    .messages { flex: 1; padding: 1rem; overflow-y: auto; display: flex; flex-direction: column; gap: 0.5rem; }
+    .msg { padding: 0.5rem 0.75rem; border-radius: 8px; max-width: 75%; background: #334155; }
+    .msg.mine { align-self: flex-end; background: #2563eb; }
+    .msg-meta { font-size: 0.75rem; opacity: 0.7; margin-bottom: 0.2rem; }
+    .typing-box { height: 1.5rem; font-size: 0.8rem; color: #94a3b8; font-style: italic; padding: 0 1rem; }
+    .input-bar { display: flex; gap: 0.5rem; padding: 1rem; background: #1e293b; border-top: 1px solid #334155; }
+    .badge { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: bold; }
+    .badge.online { background: #16a34a; }
+    .badge.offline { background: #dc2626; }
+    .room-list { overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 0.4rem; }
+    .room-item { padding: 0.5rem; border-radius: 6px; background: #0f172a; cursor: pointer; border: 1px solid transparent; }
+    .room-item.active { border-color: #3b82f6; background: #1e293b; }
+  </style>
+</head>
+<body>
+  <div class="sidebar">
+    <div class="card">
+      <h3>Authentication</h3>
+      <input id="authUsername" placeholder="Username (min 3 chars)" value="walker" />
+      <input id="authEmail" placeholder="Email" value="walker@test.com" />
+      <input id="authPassword" type="password" placeholder="Password (min 6 chars)" value="secret123" />
+      <div style="display: flex; gap: 0.5rem;">
+        <button onclick="handleRegister()">Register</button>
+        <button onclick="handleLogin()">Login</button>
+      </div>
+      <div id="authStatus" style="font-size: 0.75rem; margin-top: 0.5rem; color: #38bdf8;">Not logged in</div>
+    </div>
+
+    <div class="card">
+      <h3>Create Room</h3>
+      <input id="roomName" placeholder="Room Name" value="General Chat" />
+      <button onclick="handleCreateRoom()">+ Create Room</button>
+    </div>
+
+    <h3>Rooms</h3>
+    <div class="room-list" id="roomsList"></div>
+  </div>
+
+  <div class="main">
+    <div class="header">
+      <div>
+        <h2 id="currentRoomTitle">Select a room</h2>
+        <small id="currentRoomMeta">No room joined</small>
+      </div>
+      <div>
+        Status: <span id="socketStatus" class="badge offline">Disconnected</span>
+      </div>
+    </div>
+
+    <div class="messages" id="messagesContainer"></div>
+    <div class="typing-box" id="typingIndicator"></div>
+
+    <div class="input-bar">
+      <input id="chatInput" placeholder="Type your message..." oninput="handleTyping()" onkeydown="handleKeyDown(event)" disabled />
+      <button onclick="handleSendMessage()" style="width: 100px;">Send</button>
+    </div>
+  </div>
+
+  <script>
+    let token = localStorage.getItem("token") || "";
+    let currentUser = null;
+    let currentRoomId = null;
+    let socket = null;
+    let typingTimeout = null;
+
+    if (token) {
+      document.getElementById("authStatus").innerText = "Token found in storage. Click Login or refresh.";
+    }
+
+    async function handleRegister() {
+      const username = document.getElementById("authUsername").value.trim();
+      const email = document.getElementById("authEmail").value.trim();
+      const password = document.getElementById("authPassword").value;
+
+      const res = await fetch("/api/auth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, email, password }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        onAuthSuccess(data);
+      } else {
+        alert(data.error || "Registration failed");
+      }
+    }
+
+    async function handleLogin() {
+      const email = document.getElementById("authEmail").value.trim();
+      const password = document.getElementById("authPassword").value;
+
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        onAuthSuccess(data);
+      } else {
+        alert(data.error || "Login failed");
+      }
+    }
+
+    function onAuthSuccess(data) {
+      token = data.token;
+      currentUser = data.user;
+      localStorage.setItem("token", token);
+      document.getElementById("authStatus").innerText = `Logged in as: ${currentUser.username}`;
+      initSocket();
+      loadRooms();
+    }
+
+    function initSocket() {
+      if (socket) socket.disconnect();
+
+      socket = io({
+        auth: { token },
+      });
+
+      const badge = document.getElementById("socketStatus");
+
+      socket.on("connect", () => {
+        badge.innerText = "Connected";
+        badge.className = "badge online";
+        document.getElementById("chatInput").disabled = false;
+      });
+
+      socket.on("disconnect", () => {
+        badge.innerText = "Disconnected";
+        badge.className = "badge offline";
+      });
+
+      socket.on("new-message", (msg) => {
+        if (msg.room === currentRoomId) {
+          appendMessage(msg);
+          // Mark as read
+          socket.emit("message-read", { messageId: msg._id, roomId: currentRoomId });
+        }
+      });
+
+      socket.on("user-typing", ({ roomId, username, isTyping }) => {
+        if (roomId === currentRoomId) {
+          const el = document.getElementById("typingIndicator");
+          el.innerText = isTyping ? `${username} is typing...` : "";
+        }
+      });
+
+      socket.on("user-joined-room", ({ username }) => {
+        appendSystemNotice(`${username} joined the room`);
+      });
+
+      socket.on("user-left-room", ({ username }) => {
+        appendSystemNotice(`${username} left the room`);
+      });
+    }
+
+    async function loadRooms() {
+      const res = await fetch("/api/rooms", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      const list = document.getElementById("roomsList");
+      list.innerHTML = "";
+      data.rooms.forEach((r) => {
+        const item = document.createElement("div");
+        item.className = `room-item ${r._id === currentRoomId ? "active" : ""}`;
+        item.innerText = `# ${r.name}`;
+        item.onclick = () => selectRoom(r);
+        list.appendChild(item);
+      });
+    }
+
+    async function handleCreateRoom() {
+      const name = document.getElementById("roomName").value.trim();
+      if (!name) return;
+
+      const res = await fetch("/api/rooms", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ name, isPrivate: false }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        await loadRooms();
+        selectRoom(data.room);
+      }
+    }
+
+    async function selectRoom(room) {
+      if (currentRoomId && socket) {
+        socket.emit("leave-room", { roomId: currentRoomId });
+      }
+
+      currentRoomId = room._id;
+      document.getElementById("currentRoomTitle").innerText = `# ${room.name}`;
+      document.getElementById("currentRoomMeta").innerText = `ID: ${room._id}`;
+
+      if (socket) {
+        socket.emit("join-room", { roomId: currentRoomId });
+      }
+
+      await loadMessages(room._id);
+      loadRooms();
+    }
+
+    async function loadMessages(roomId) {
+      const res = await fetch(`/api/rooms/${roomId}/messages`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      const container = document.getElementById("messagesContainer");
+      container.innerHTML = "";
+      if (data.messages) {
+        data.messages.forEach(appendMessage);
+      }
+    }
+
+    function appendMessage(msg) {
+      const container = document.getElementById("messagesContainer");
+      const isMine = currentUser && (msg.sender?._id === currentUser.id || msg.sender === currentUser.id);
+
+      const el = document.createElement("div");
+      el.className = `msg ${isMine ? "mine" : ""}`;
+      el.innerHTML = `
+        <div class="msg-meta">${msg.sender?.username || "User"} • ${new Date(msg.createdAt).toLocaleTimeString()}</div>
+        <div>${msg.content}</div>
+      `;
+      container.appendChild(el);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function appendSystemNotice(text) {
+      const container = document.getElementById("messagesContainer");
+      const el = document.createElement("div");
+      el.style.textAlign = "center";
+      el.style.fontSize = "0.75rem";
+      el.style.opacity = "0.6";
+      el.innerText = text;
+      container.appendChild(el);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function handleTyping() {
+      if (!socket || !currentRoomId) return;
+      socket.emit("typing", { roomId: currentRoomId, isTyping: true });
+      clearTimeout(typingTimeout);
+      typingTimeout = setTimeout(() => {
+        socket.emit("typing", { roomId: currentRoomId, isTyping: false });
+      }, 1500);
+    }
+
+    function handleKeyDown(event) {
+      if (event.key === "Enter") handleSendMessage();
+    }
+
+    function handleSendMessage() {
+      const input = document.getElementById("chatInput");
+      const content = input.value.trim();
+      if (!content || !currentRoomId || !socket) return;
+
+      socket.emit("send-message", { roomId: currentRoomId, content }, (res) => {
+        if (res && res.error) alert(res.error);
+      });
+      input.value = "";
+      socket.emit("typing", { roomId: currentRoomId, isTyping: false });
+    }
+  </script>
+</body>
+</html>
